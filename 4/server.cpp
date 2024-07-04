@@ -1,31 +1,22 @@
 #include <iostream>
 #include <vector>
 #include <list>
-#include <algorithm>
 #include <functional>
-#include <string>
-#include <sstream>
-#include <pthread.h>
-#include <sys/socket.h>
+#include <algorithm>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <stdint.h>
-#include <signal.h>
+#include <cstring>
+#include <sstream>
+#include <fcntl.h>
+#include <sys/select.h>
 
 using namespace std;
 
-#define PORT 9033   // Port we're listening on
-
-int listener;     // Listening socket descriptor
-
-// Define global variables for graph representation
-int n = 0, m = 0; // Number of vertices and edges
-vector<list<int>> adj; // Adjacency list for the graph
-vector<list<int>> adjT; // Transpose adjacency list for Kosaraju's algorithm
+// Global variables for graph representation
+int n = 0, m = 0;
+vector<list<int>> adj;
+vector<list<int>> adjT;
 
 // Function to initialize a new graph
 void Newgraph(int numVertices, int numEdges) {
@@ -36,6 +27,29 @@ void Newgraph(int numVertices, int numEdges) {
     adj.resize(n);
     adjT.clear();
     adjT.resize(n);
+
+    cout << "New graph created with " << numVertices << " vertices and " << numEdges << " edges." << endl;
+}
+
+// Function to add a new edge
+void Newedge(int u, int v) {
+    adj[u].push_back(v);
+    adjT[v].push_back(u);
+    cout << "Edge added: " << u << " -> " << v << endl;
+}
+
+// Function to remove an edge
+void Removeedge(int u, int v) {
+    auto it = find(adj[u].begin(), adj[u].end(), v);
+    if (it != adj[u].end()) {
+        adj[u].erase(it);
+        cout << "Edge removed: " << u << " -> " << v << endl;
+    }
+
+    it = find(adjT[v].begin(), adjT[v].end(), u);
+    if (it != adjT[v].end()) {
+        adjT[v].erase(it);
+    }
 }
 
 // Kosaraju's algorithm function
@@ -49,7 +63,6 @@ void Kosaraju(int client_fd) {
     vector<bool> visited(n, false);
     list<int> order;
 
-    // First DFS to fill order of vertices
     function<void(int)> dfs1 = [&](int u) {
         visited[u] = true;
         for (int v : adj[u]) {
@@ -60,18 +73,16 @@ void Kosaraju(int client_fd) {
         order.push_back(u);
     };
 
-    // Perform DFS on each vertex to fill the order
     for (int i = 0; i < n; ++i) {
         if (!visited[i]) {
             dfs1(i);
         }
     }
 
-    reverse(order.begin(), order.end());
+    order.reverse();
     vector<int> component(n, -1);
     vector<list<int>> components; // To store the nodes of each component
 
-    // Second DFS on the transpose graph
     function<void(int, int)> dfs2 = [&](int u, int comp) {
         component[u] = comp;
         components[comp].push_back(u);
@@ -90,7 +101,6 @@ void Kosaraju(int client_fd) {
         }
     }
 
-    // Prepare the result to send to the client
     string result = "Number of strongly connected components: " + to_string(comp) + "\n";
     for (int i = 0; i < comp; ++i) {
         result += "Component " + to_string(i + 1) + ": ";
@@ -101,37 +111,28 @@ void Kosaraju(int client_fd) {
     }
 
     send(client_fd, result.c_str(), result.size(), 0);
+    cout << "Kosaraju's algorithm executed. Result sent to client." << endl;
 }
 
-// Function to add a new edge
-void Newedge(int u, int v) {
-    adj[u].push_back(v);
-    adjT[v].push_back(u);
-}
-
-// Function to remove an edge
-void Removeedge(int u, int v) {
-    auto it = find(adj[u].begin(), adj[u].end(), v);
-    if (it != adj[u].end()) {
-        adj[u].erase(it);
-    }
-
-    it = find(adjT[v].begin(), adjT[v].end(), u);
-    if (it != adjT[v].end()) {
-        adjT[v].erase(it);
-    }
-}
-
-// Function to handle each client in a separate thread
-void *handle_client(void *arg) {
-    int client_fd = (intptr_t)arg;
+void handle_client(int client_fd, fd_set &master_set, fd_set &read_fds) {
     char buf[1024];
     int numbytes;
+    string command;
+    stringstream ss;
 
-    while ((numbytes = recv(client_fd, buf, sizeof(buf) - 1, 0)) > 0) {
+    if ((numbytes = recv(client_fd, buf, sizeof(buf) - 1, 0)) <= 0) {
+        if (numbytes == 0) {
+            cout << "Socket " << client_fd << " hung up" << endl;
+        } else {
+            perror("recv");
+        }
+        close(client_fd);
+        FD_CLR(client_fd, &master_set);
+    } else {
         buf[numbytes] = '\0';
-        string command(buf);
-        stringstream ss(command);
+        command.append(buf);
+        ss.clear();
+        ss.str(command);
         string cmd;
         ss >> cmd;
 
@@ -145,13 +146,22 @@ void *handle_client(void *arg) {
             send(client_fd, msg.c_str(), msg.size(), 0);
 
             for (int i = 0; i < numEdges; ++i) {
-                if ((numbytes = recv(client_fd, buf, sizeof(buf) - 1, 0)) > 0) {
-                    buf[numbytes] = '\0';
-                    stringstream edge_ss(buf);
-                    int u, v;
-                    edge_ss >> u >> v;
-                    Newedge(u, v);
+                numbytes = recv(client_fd, buf, sizeof(buf) - 1, 0);
+                if (numbytes <= 0) {
+                    if (numbytes == 0) {
+                        cout << "Socket " << client_fd << " hung up" << endl;
+                    } else {
+                        perror("recv");
+                    }
+                    close(client_fd);
+                    FD_CLR(client_fd, &master_set);
+                    return;
                 }
+                buf[numbytes] = '\0';
+                stringstream edge_ss(buf);
+                int u, v;
+                edge_ss >> u >> v;
+                Newedge(u, v);
             }
 
             msg = "Graph created with " + to_string(numVertices) + " vertices and " + to_string(numEdges) + " edges.\n";
@@ -170,37 +180,25 @@ void *handle_client(void *arg) {
             Removeedge(u, v);
             string msg = "Edge " + to_string(u) + " " + to_string(v) + " removed.\n";
             send(client_fd, msg.c_str(), msg.size(), 0);
-        } else if (cmd == "Exit") {
-            string msg = "Goodbye!\n";
-            send(client_fd, msg.c_str(), msg.size(), 0);
-            break;
         } else {
             string msg = "Invalid command\n";
             send(client_fd, msg.c_str(), msg.size(), 0);
         }
+
+        command.clear(); // Clear the command buffer
     }
-
-    close(client_fd);
-    return NULL;
-}
-
-// Signal handler to gracefully shut down the server
-void signal_handler(int signum) {
-    // Close the listening socket
-    close(listener);
-    printf("Server shut down gracefully\n");
-    exit(signum);
 }
 
 int main() {
-    struct sockaddr_in serveraddr;    // Server address
-    struct sockaddr_in clientaddr;    // Client address
+    int listener;     // Listening socket descriptor
+    struct sockaddr_in serveraddr;    // server address
+    struct sockaddr_in clientaddr;    // client address
     socklen_t addrlen;
-    char buf[1024];    // Buffer for client data
+    const int PORT = 9034;
 
-    // Set up the signal handler for SIGINT and SIGTSTP
-    signal(SIGINT, signal_handler);
-    signal(SIGTSTP, signal_handler);
+
+    fd_set master_set, read_fds;
+    int fdmax;
 
     // Create a new listener socket
     if ((listener = socket(AF_INET, SOCK_STREAM, 0)) == -1) {
@@ -214,6 +212,9 @@ int main() {
         perror("setsockopt");
         exit(1);
     }
+
+    // Set the listener socket to non-blocking
+    fcntl(listener, F_SETFL, O_NONBLOCK);
 
     // Set up the server address struct
     serveraddr.sin_family = AF_INET;
@@ -235,36 +236,42 @@ int main() {
 
     printf("Server is running on port %d\n", PORT);
 
-    while (1) {
-        addrlen = sizeof(clientaddr);
-        int newfd = accept(listener, (struct sockaddr *)&clientaddr, &addrlen);
+    FD_ZERO(&master_set);
+    FD_ZERO(&read_fds);
+    FD_SET(listener, &master_set);
+    fdmax = listener;
 
-        if (newfd == -1) {
-            perror("accept");
-            continue;
+    while (true) {
+        read_fds = master_set; // Copy the master set to the read set
+
+        if (select(fdmax + 1, &read_fds, nullptr, nullptr, nullptr) == -1) {
+            perror("select");
+            exit(1);
         }
 
-        printf("New connection from %s on socket %d\n", inet_ntoa(clientaddr.sin_addr), newfd);
+        for (int i = 0; i <= fdmax; ++i) {
+            if (FD_ISSET(i, &read_fds)) { // We got one!!
+                if (i == listener) {
+                    // Handle new connections
+                    addrlen = sizeof(clientaddr);
+                    int newfd = accept(listener, (struct sockaddr *)&clientaddr, &addrlen);
 
-        pthread_t client_thread;
-        if (pthread_create(&client_thread, NULL, handle_client, (void *)(intptr_t)newfd) != 0) {
-            perror("pthread_create");
-            close(newfd);
+                    if (newfd == -1) {
+                        perror("accept");
+                    } else {
+                        printf("New connection from %s on socket %d\n", inet_ntoa(clientaddr.sin_addr), newfd);
+                        FD_SET(newfd, &master_set); // Add to master set
+                        if (newfd > fdmax) {
+                            fdmax = newfd;
+                        }
+                    }
+                } else {
+                    // Handle data from a client
+                    handle_client(i, master_set, read_fds);
+                }
+            }
         }
     }
 
     return 0;
 }
-
-//make
-//./server
-//telnet localhost 9034
-//Newgraph 3 3
-//0 1
-//0 2
-//1 2
-//Kosaraju
-//Newedge 2 0
-//Removeedge 0 1
-//Kosaraju
-//Exit

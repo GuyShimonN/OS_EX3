@@ -15,6 +15,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <signal.h>
+#include <atomic>
 #include "proactor.hpp"
 
 using namespace std;
@@ -29,6 +30,10 @@ vector<list<int>> adj; // Adjacency list for the graph
 vector<list<int>> adjT; // Transpose adjacency list for Kosaraju's algorithm
 
 pthread_mutex_t graph_mutex = PTHREAD_MUTEX_INITIALIZER; // Mutex for protecting the graph
+pthread_cond_t scc_cond = PTHREAD_COND_INITIALIZER;
+pthread_mutex_t scc_mutex = PTHREAD_MUTEX_INITIALIZER;
+atomic<bool> large_scc_exists(false);
+atomic<bool> keep_monitoring(true);
 
 // Function to initialize a new graph
 void Newgraph(int numVertices, int numEdges) {
@@ -47,8 +52,10 @@ void Newgraph(int numVertices, int numEdges) {
 void Kosaraju(int client_fd) {
     pthread_mutex_lock(&graph_mutex);
     if (n <= 0 || m <= 0 || m > 2 * n) {
-        string msg = "Invalid input\n";
-        send(client_fd, msg.c_str(), msg.size(), 0);
+        if (client_fd != -1) {
+            string msg = "Invalid input\n";
+            send(client_fd, msg.c_str(), msg.size(), 0);
+        }
         pthread_mutex_unlock(&graph_mutex);
         return;
     }
@@ -107,7 +114,23 @@ void Kosaraju(int client_fd) {
         result += "\n";
     }
 
-    send(client_fd, result.c_str(), result.size(), 0);
+    int largest_component_size = 0;
+    for (const auto& component : components) {
+        largest_component_size = max(largest_component_size, static_cast<int>(component.size()));
+    }
+
+    bool new_large_scc_exists = (largest_component_size >= n / 2);
+    
+    pthread_mutex_lock(&scc_mutex);
+    if (new_large_scc_exists != large_scc_exists.load()) {
+        large_scc_exists.store(new_large_scc_exists);
+        pthread_cond_signal(&scc_cond);
+    }
+    pthread_mutex_unlock(&scc_mutex);
+
+    if (client_fd != -1) {
+        send(client_fd, result.c_str(), result.size(), 0);
+    }
     pthread_mutex_unlock(&graph_mutex);
 }
 
@@ -117,6 +140,8 @@ void Newedge(int u, int v) {
     adj[u].push_back(v);
     adjT[v].push_back(u);
     pthread_mutex_unlock(&graph_mutex);
+    
+    Kosaraju(-1); // Pass -1 as we don't need to send results to a client
 }
 
 // Function to remove an edge
@@ -136,6 +161,8 @@ void Removeedge(int u, int v) {
     }
 
     pthread_mutex_unlock(&graph_mutex);
+    
+    Kosaraju(-1); // Pass -1 as we don't need to send results to a client
 }
 
 // Function to handle each client in a separate thread
@@ -199,6 +226,23 @@ void* handle_client(int sockfd) {
     return NULL;
 }
 
+// Function to monitor SCC status
+void* monitor_scc(void* arg) {
+    while (keep_monitoring.load()) {
+        pthread_mutex_lock(&scc_mutex);
+        pthread_cond_wait(&scc_cond, &scc_mutex);
+        
+        if (large_scc_exists.load()) {
+            cout << "At least 50% of the graph belongs to the same SCC" << endl;
+        } else {
+            cout << "At least 50% of the graph no longer belongs to the same SCC" << endl;
+        }
+        
+        pthread_mutex_unlock(&scc_mutex);
+    }
+    return NULL;
+}
+
 // Signal handler to gracefully shut down the server
 void signal_handler(int signum) {
     // Close the listening socket
@@ -250,6 +294,13 @@ int main() {
 
     printf("Server is running on port %d\n", PORT);
 
+    // Start the SCC monitoring thread
+    pthread_t scc_monitor_thread;
+    if (pthread_create(&scc_monitor_thread, NULL, monitor_scc, NULL) != 0) {
+        perror("pthread_create");
+        exit(1);
+    }
+
     while (1) {
         addrlen = sizeof(clientaddr);
         int newfd = accept(listener, (struct sockaddr *)&clientaddr, &addrlen);
@@ -270,5 +321,25 @@ int main() {
         }
     }
 
+    // Stop the monitoring thread before exiting
+    keep_monitoring.store(false);
+    pthread_cond_signal(&scc_cond);
+    pthread_join(scc_monitor_thread, NULL);
+
     return 0;
 }
+// make
+// ./server
+// open a new terminal
+// nc localhost 9033
+//Newgraph 6 5
+//0 1
+//1 2
+//2 0
+//3 4
+//4 5
+//Kosaraju
+//open a new terminal
+// Removeedge 0 1
+//Kosaraju
+//Exit
